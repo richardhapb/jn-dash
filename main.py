@@ -17,13 +17,27 @@ if not conn_str:
 
 conn = create_engine(conn_str)
 
-data = pd.read_sql("select * from logs", conn)
-data["minutes"] = (data["end_time_ms"] - data["init_time_ms"]) / 60_000
-# Convert timestamp to datetime for better plotting
-data["date"] = pd.to_datetime(data["init_time_ms"], unit="ms").dt.tz_localize('UTC').dt.tz_convert(pytz.timezone("America/Santiago"))
+# Initial empty DataFrame structures
+data = pd.DataFrame()
+category_totals = pd.DataFrame()
 
-# Calculate total time spent per category
-category_totals = data.groupby("category")["minutes"].sum().reset_index()
+
+def load_data():
+    """Load fresh data from the database"""
+    df = pd.read_sql("select * from logs", conn)
+
+    # Print check to ensure categories are loaded
+    print(f"Data loaded: {len(df)} rows, Categories found: {df['category'].unique()}")
+
+    df["minutes"] = (df["end_time_ms"] - df["init_time_ms"]) / 60_000
+    # Convert timestamp to datetime for better plotting
+    df["date"] = (
+        pd.to_datetime(df["init_time_ms"], unit="ms")
+        .dt.tz_localize("UTC")
+        .dt.tz_convert(pytz.timezone("America/Santiago"))
+    )
+    return df
+
 
 app = Dash(__name__)
 
@@ -31,7 +45,12 @@ app = Dash(__name__)
 template = "plotly_dark"
 
 app.layout = html.Div(
-    style={"backgroundColor": "#111111", "color": "#FFFFFF", "padding": "20px", "minHeight": "100vh"},
+    style={
+        "backgroundColor": "#111111",
+        "color": "#FFFFFF",
+        "padding": "20px",
+        "minHeight": "100vh",
+    },
     children=[
         html.H1(
             children="Time Usage Dashboard", style={"textAlign": "center", "marginBottom": "30px"}
@@ -57,21 +76,41 @@ app.layout = html.Div(
             ),
         ]),
         html.H2("Time Usage Trends", style={"marginTop": "30px"}),
-        html.Div([
-            dcc.Dropdown(
-                id="category-filter",
-                options=[{"label": cat, "value": cat} for cat in data["category"].unique()],
-                value=data["category"].unique().tolist(),
-                multi=True,
-                style={"backgroundColor": "#222222", "color": "#000000"},
-            ),
-            dcc.Graph(id="time-series"),
-        ]),
-        html.H2("Daily Breakdown", style={"marginTop": "30px"}),
-        dcc.Graph(id="heatmap"),
-        dcc.Store(id="store"),
+        html.Div(
+            [
+                html.Div([
+                    dcc.Dropdown(
+                        id="category-filter",
+                        options=[],  # Will be populated when data loads
+                        value=[],  # Will be populated when data loads
+                        multi=True,
+                        style={"backgroundColor": "#222222", "color": "#000000"},
+                    ),
+                    dcc.Graph(id="time-series"),
+                ]),
+                html.H2("Daily Breakdown", style={"marginTop": "30px"}),
+                dcc.Graph(id="heatmap"),
+                dcc.Store(id="store", data={"refresh": True}),
+                dcc.Interval(
+                    id="interval-component",
+                    interval=1000,  # refresh every second (when page is loaded)
+                    n_intervals=0,
+                    max_intervals=1,  # run once only when page loads
+                ),
+            ],
+        ),
     ],
 )
+
+
+@callback(Output("store", "data"), Input("interval-component", "n_intervals"))
+def refresh_data(_):
+    """Refresh data from database"""
+    global data, category_totals
+    data = load_data()
+    # Calculate total time spent per category
+    category_totals = data.groupby("category")["minutes"].sum().reset_index()
+    return {"refresh": True, "timestamp": pd.Timestamp.now().isoformat()}
 
 
 @callback(Output("pie-chart", "figure"), Input("store", "data"))
@@ -102,9 +141,25 @@ def update_bar_chart(_):
     return fig
 
 
-@callback(Output("time-series", "figure"), Input("category-filter", "value"))
-def update_time_series(selected_categories):
-    filtered_data = data[data["category"].isin(selected_categories)]
+@callback(
+    [Output("category-filter", "options"), Output("category-filter", "value")],
+    Input("store", "data"),
+)
+def update_dropdown(_):
+    """Update dropdown options and values when data refreshes"""
+    categories = data["category"].unique().tolist()
+    options = [{"label": cat, "value": cat} for cat in categories]
+    print(options)
+    return options, categories
+
+
+@callback(
+    Output("time-series", "figure"), [Input("category-filter", "value"), Input("store", "data")]
+)
+def update_time_series(selected_categories, _):
+    filtered_data = (
+        data[data["category"].isin(selected_categories)] if selected_categories else data
+    )
     # Group by date and category to show daily trends
     daily_data = (
         filtered_data.groupby([pd.Grouper(key="date", freq="D"), "category"])["minutes"]
@@ -117,21 +172,22 @@ def update_time_series(selected_categories):
         x="date",
         y="minutes",
         color="category",
-        title="Daily Time Usage Trends",
+        title="Daily Time Usage by Category",
         template=template,
     )
-    fig.update_xaxes(title="Date")
-    fig.update_yaxes(title="Minutes")
     return fig
 
 
 @callback(Output("heatmap", "figure"), Input("store", "data"))
 def update_heatmap(_):
     # Create heatmap of activity by day of week and hour
-    data["day_of_week"] = data["date"].dt.day_name()
-    data["hour"] = data["date"].dt.hour
+    # These calculations need to happen each time to ensure fresh data
+    day_data = data.copy()
+    day_data["day_of_week"] = day_data["date"].dt.day_name()
+    day_data["hour"] = day_data["date"].dt.hour
 
-    heatmap_data = data.groupby(["day_of_week", "hour", "category"])["minutes"].sum().reset_index()
+    day_data = day_data[day_data["category"] != "sleep"]
+    heatmap_data = day_data.groupby(["day_of_week", "hour", "category"])["minutes"].sum().reset_index()
 
     fig = px.density_heatmap(
         heatmap_data,
@@ -159,4 +215,3 @@ def update_heatmap(_):
 
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=7050)
-
